@@ -2,8 +2,12 @@ name: Build Qt
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 env:
   QT_VERSION: '6.8.3'
+  APP_NAME: NiProject          # ← 改成你的 exe / app 实际名字（不含后缀）
 
 jobs:
   build:
@@ -13,16 +17,16 @@ jobs:
         include:
           - platform: windows
             os: windows-latest
-            host: windows
             arch: win64_msvc2022_64
+            qt_dir: qt/6.8.3/msvc2022_64
           - platform: macos
             os: macos-latest
-            host: mac
             arch: clang_64
+            qt_dir: qt/6.8.3/macos
           - platform: linux
             os: ubuntu-22.04
-            host: linux
             arch: linux_gcc_64
+            qt_dir: qt/6.8.3/gcc_64
 
     runs-on: ${{ matrix.os }}
 
@@ -31,9 +35,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: matrix.platform == 'windows'
-
+      # ---------- 工具 ----------
       - name: 安装 Ninja (Windows)
         if: matrix.platform == 'windows'
         run: choco install ninja -y
@@ -42,40 +44,123 @@ jobs:
         if: matrix.platform == 'macos'
         run: brew install ninja
 
-      - name: 安装 Ninja (Linux)
+      - name: 安装系统依赖 (Linux)
         if: matrix.platform == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-        
-      - name: 安装 Qt
-        uses: jurplel/install-qt-action@v4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libopengl-dev libxkbcommon0 \
+            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-cursor0 libxcb-shape0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.platform == 'windows'
+
+      # ---------- Qt 官方在线安装器 ----------
+      - name: 下载 Qt 在线安装器
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            curl -L -o qt-installer.exe https://download.qt.io/official_releases/online_installers/qt-online-installer-windows-x64.exe
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            curl -L -o qt-installer.app https://download.qt.io/official_releases/online_installers/qt-online-installer-mac-x64.app
+            xattr -cr qt-installer.app
+          else
+            curl -L -o qt-installer.run https://download.qt.io/official_releases/online_installers/qt-online-installer-linux-x64.run
+            chmod +x qt-installer.run
+          fi
+
+      - name: 缓存 Qt
+        id: qt
+        uses: actions/cache@v4
         with:
-          version: ${{ env.QT_VERSION }}
-          host: ${{ matrix.host }}
-          arch: ${{ matrix.arch }}
-          target: desktop
-          cache: true
+          path: ${{ matrix.qt_dir }}
+          key: qt-${{ env.QT_VERSION }}-${{ matrix.arch }}
 
+      - name: 安装 Qt
+        if: steps.qt.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          case "${{ matrix.platform }}" in
+            windows) CMD="./qt-installer.exe" ;;
+            macos)   CMD="./qt-installer.app/Contents/MacOS/qt-online-installer" ;;
+            linux)   CMD="./qt-installer.run" ;;
+          esac
+          QT_BASE="${{ matrix.qt_dir }}"
+          $CMD install --root "$QT_BASE" \
+            --archives qtbase qttools qtshadertools \
+            --platform desktop \
+            --accept-licenses --confirm-command
+          rm -rf "$QT_BASE"/Examples "$QT_BASE"/doc
+          # 自动找到 qmake 路径，供后续步骤使用
+          echo "QMAKE=$(find "$QT_BASE" -name qmake -type f | head -n1)" >> "$GITHUB_ENV"
+
+      - name: 找回缓存的 qmake 路径
+        if: steps.qt.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          QT_BASE="${{ matrix.qt_dir }}"
+          echo "QMAKE=$(find "$QT_BASE" -name qmake -type f | head -n1)" >> "$GITHUB_ENV"
+
+      # ---------- 配置（qmake） ----------
       - name: 配置
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          set -e
+          mkdir -p build
+          # 找不到 qmake 就直接报错，日志里会打出搜索结果
+          if [ -z "$QMAKE" ]; then
+            echo "ERROR: qmake not found under ${{ matrix.qt_dir }}"
+            find "${{ matrix.qt_dir }}" -name qmake
+            exit 1
+          fi
+          echo "Using qmake: $QMAKE"
+          "$QMAKE" -version
+          "$QMAKE" "${{ github.workspace }}" -o build
 
+      # ---------- 编译 ----------
       - name: 编译
-        run: cmake --build build --config Release
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            cmake --build build --config Release --target all
+          else
+            cmake --build build --target all
+          fi
 
+      # ---------- 打包 macOS ----------
       - name: 打包 macOS
         if: matrix.platform == 'macos'
+        shell: bash
         run: |
-          macdeployqt build/MyApp.app
-          hdiutil create -volname MyApp -srcfolder build/MyApp.app -ov -format UDZO MyApp.dmg
+          set -e
+          APP="build/${{ env.APP_NAME }}.app"
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: $APP not found"; ls -R build; exit 1
+          fi
+          "$QMAKE" -query QT_INSTALL_BINS
+          "$(dirname "$QMAKE")/macdeployqt" "$APP" -verbose=2
+          find "$APP/Contents/Frameworks" -name Headers -exec rm -rf {} + 2>/dev/null || true
+          find "$APP/Contents/Frameworks" -name "*.prl" -delete 2>/dev/null || true
+          hdiutil create -volname "${{ env.APP_NAME }}" -srcfolder "$APP" -ov -format UDZO "${{ env.APP_NAME }}.dmg"
 
+      # ---------- 打包 Windows ----------
       - name: 打包 Windows
         if: matrix.platform == 'windows'
+        shell: pwsh
         run: |
-          windeployqt build/Release/MyApp.exe
-          Compress-Archive build/Release/* MyApp-Windows.zip
+          $app = "build\Release\${{ env.APP_NAME }}.exe"
+          if (-not (Test-Path $app)) { Get-ChildItem build -Recurse -Filter *.exe; throw "$app not found" }
+          & "$env:QMAKE\..\windeployqt.exe" --release $app
+          Compress-Archive "build\Release\*" -DestinationPath "${{ env.APP_NAME }}-Windows.zip" -Force
 
-      - uses: actions/upload-artifact@v4
+      # ---------- 上传产物 ----------
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
           path: |
             *.dmg
-            *.zip
+            *-Windows.zip
+          if-no-files-found: ignore
