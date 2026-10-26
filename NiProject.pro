@@ -1,3 +1,6 @@
+TEMPLATE = app
+TARGET = NiProject
+
 QT += widgets
 
 CONFIG += c++17
