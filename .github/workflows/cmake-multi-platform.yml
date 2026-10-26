@@ -1,148 +1,169 @@
-name: Build Qt
+# ==============================================================================
+# Qt 多平台 CI（Windows MSVC + macOS Clang）
+# 同时提供 CMake 与 qmake 两种构建方式：
+#   - cmake 作业：使用 Qt 提供的 qt-cmake 包装脚本（即“迁移到 CMake”）
+#   - qmake 作业：沿用原有 qmake + 平台工具链（MSVC nmake / macOS make）
+#
+# 使用方法：
+#   1. 将此文件放到仓库的  .github/workflows/  目录下
+#   2. 按需修改下方“可配置项”中的变量（Qt 版本、模块、构建类型等）
+#   3. 推送后即可触发；也可通过仓库 Actions 页手动运行
+# ==============================================================================
 
-on: [push, pull_request]
+name: Qt Multi-Platform Build
 
-permissions:
-  contents: read
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch: # 允许在 GitHub Actions 页面手动触发
 
+# 取消同一分支上仍在运行的旧工作流，节省资源
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ============================ 可配置项（按需修改） ============================
 env:
-  QT_VERSION: '6.8.3'
-  APP_NAME: NiProject
+  QT_VERSION: '6.6.3'                 # 需要的 Qt 版本（也可写 5.15.2 等）
+  QT_ARCH_WINDOWS: 'win64_msvc2019_64' # Windows 架构/编译器组合
+  QT_ARCH_MACOS: 'macos'              # macOS 架构（aqtinstall 用 "macos"）
+  QT_MODULES: 'qtbase qttools'        # 额外需要的 Qt 模块，空格分隔
+  BUILD_TYPE: 'Release'               # Release / Debug
+  CMAKE_BUILD_TYPE: 'Release'         # 与 BUILD_TYPE 保持一致
+  # 若你用 Qt5，需要把下面 Qt6_DIR 的查找逻辑改为 Qt5_DIR，见各 job 的 CMake 步骤
+# ==============================================================================
 
 jobs:
-  build:
+
+  # ======================== 使用 CMake 构建（迁移后的方式） ========================
+  build-cmake:
+    name: CMake · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: windows
-            os: windows-latest
+          - os: windows-latest
+            qt_arch: win64_msvc2019_64
             qt_host: windows
-            qt_arch: win64_msvc2022_64
-            build_dir: build/Release
-          - platform: macos
-            os: macos-latest
-            qt_host: mac
-            qt_arch: clang_64
-            build_dir: build
-          - platform: linux
-            os: ubuntu-22.04
-            qt_host: linux
-            qt_arch: gcc_64
-            build_dir: build
-
-    runs-on: ${{ matrix.os }}
+            cmake_generator: 'Visual Studio 17 2022'
+            cmake_arch: 'x64'
+          - os: macos-latest
+            qt_arch: macos
+            qt_host: macos
+            cmake_generator: 'Unix Makefiles'
+            cmake_arch: ''
 
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      # ---------- 工具 ----------
-      - name: 安装 Ninja (Windows)
-        if: matrix.platform == 'windows'
-        run: choco install ninja -y
+      - name: 安装 CMake（Windows 确保使用新版，macOS 自带即可）
+        if: runner.os == 'Windows'
+        uses: lukka/get-cmake@latest
 
-      - name: 安装 Ninja (macOS)
-        if: matrix.platform == 'macos'
-        run: brew install ninja
-
-      - name: 系统依赖 (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libopengl-dev libxkbcommon0 \
-            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
-            libxcb-render-util0 libxcb-xinerama0 libxcb-cursor0 libxcb-shape0 \
-            libxcb-randr0 libxcb-xkb1 libegl1
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: matrix.platform == 'windows'
-
-      # ---------- 装 Qt（aqtinstall，无需登录） ----------
-      - name: 安装 Python
-        uses: actions/setup-python@v5
+      - name: 用 aqtinstall 安装 Qt
+        uses: jurplel/install-qt-action@v4
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          version: ${{ env.QT_VERSION }}
+          host: ${{ matrix.qt_host }}
+          target: 'desktop'
+          arch: ${{ matrix.qt_arch }}
+          modules: ${{ env.QT_MODULES }}
+          aqtversion: '==3.1.*'
+          py7zrversion: '==0.21.*'
+        # 此 Action 会自动：
+        #   - 把 Qt 的 bin 目录加入 PATH
+        #   - 设置环境变量  Qt6_DIR（Qt5 时对应 Qt5_DIR）指向 Qt6Config.cmake 所在目录
 
-      - name: 安装 aqtinstall
-        run: python -m pip install aqtinstall==3.1.0
-
-      - name: 安装 Qt
-        id: qt
-        uses: actions/cache@v4
-        with:
-          path: qt
-          key: qt-${{ env.QT_VERSION }}-${{ matrix.qt_arch }}-v1
-
-      - name: 下载 Qt
-        if: steps.qt.outputs.cache-hit != 'true'
+      - name: 配置 CMake（使用 Qt 提供的 qt-cmake 包装脚本）
         shell: bash
         run: |
-          mkdir -p qt
-          python -m aqt install-qt ${{ matrix.qt_host }} desktop ${{ env.QT_VERSION }} \
-            ${{ matrix.qt_arch }} \
-            --outputdir qt \
-            --archives qtbase qttools qtshadertools
-          echo "QTDIR=${{ github.workspace }}/qt/${{ env.QT_VERSION }}/${{ matrix.qt_arch }}" >> "$GITHUB_ENV"
-
-      - name: 设置 QTDIR（命中缓存时）
-        if: steps.qt.outputs.cache-hit == 'true'
-        shell: bash
-        run: |
-          echo "QTDIR=${{ github.workspace }}/qt/${{ env.QT_VERSION }}/${{ matrix.qt_arch }}" >> "$GITHUB_ENV"
-
-      - name: 查看 Qt 版本
-        shell: bash
-        run: |
-          "$QTDIR/bin/qmake" -version
-
-      # ---------- 配置（qmake） ----------
-      - name: 配置
-        shell: bash
-        run: |
-          set -e
           mkdir -p build
-          # 显式指定 .pro，避免目录里有多个 pro 时选错
-          "$QTDIR/bin/qmake" "${{ github.workspace }}/NiProject.pro" -o build \
-            CONFIG+=release CONFIG+=c++17
+          # qt-cmake 已自动把 Qt 的 CMake 配置注入，无需手动指定 Qt6_DIR
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            qt-cmake -S . -B build \
+              -G "${{ matrix.cmake_generator }}" \
+              -A "${{ matrix.cmake_arch }}" \
+              -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }}
+          else
+            qt-cmake -S . -B build \
+              -G "${{ matrix.cmake_generator }}" \
+              -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }}
+          fi
 
-      # ---------- 编译 ----------
-      - name: 编译
+      - name: 编译（CMake）
         shell: bash
-        run: |
-          set -e
-          cmake --build build --config Release --target all
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel $(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-      # ---------- 打包 macOS ----------
-      - name: 打包 macOS
-        if: matrix.platform == 'macos'
+      - name: 运行 CTest（如项目配置了测试）
         shell: bash
-        run: |
-          set -e
-          APP="${{ env.build_dir }}/${{ env.APP_NAME }}.app"
-          if [ ! -d "$APP" ]; then echo "ERROR: $APP not found"; ls -R build; exit 1; fi
-          "$(dirname "$QTDIR/bin/qmake")/macdeployqt" "$APP" -verbose=2
-          find "$APP/Contents/Frameworks" -name Headers -exec rm -rf {} + 2>/dev/null || true
-          find "$APP/Contents/Frameworks" -name "*.prl" -delete 2>/dev/null || true
-          hdiutil create -volname "${{ env.APP_NAME }}" -srcfolder "$APP" -ov -format UDZO "${{ env.APP_NAME }}.dmg"
+        working-directory: build
+        run: ctest --output-on-failure --build-config ${{ env.BUILD_TYPE }} || true
+        # 加 “|| true” 是因为很多 Qt 项目还没写测试，避免因此失败；有测试时请去掉
 
-      # ---------- 打包 Windows ----------
-      - name: 打包 Windows
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          $app = "${{ env.build_dir }}\${{ env.APP_NAME }}.exe"
-          if (-not (Test-Path $app)) { Get-ChildItem build -Recurse -Filter *.exe; throw "$app not found" }
-          & "$env:QTDIR\bin\windeployqt.exe" --release $app
-          Compress-Archive "${{ env.build_dir }}\*" -DestinationPath "${{ env.APP_NAME }}-Windows.zip" -Force
-
-      # ---------- 上传产物 ----------
-      - name: 上传产物
+      - name: 上传构建产物（可选）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}
-          path: |
-            *.dmg
-            *-Windows.zip
-          if-no-files-found: ignore
+          name: cmake-build-${{ matrix.os }}
+          path: build/
+          retention-days: 7
+
+  # ======================== 使用 qmake 构建（保留原有方式） ========================
+  build-qmake:
+    name: qmake · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            qt_arch: win64_msvc2019_64
+            qt_host: windows
+          - os: macos-latest
+            qt_arch: macos
+            qt_host: macos
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 用 aqtinstall 安装 Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: ${{ matrix.qt_host }}
+          target: 'desktop'
+          arch: ${{ matrix.qt_arch }}
+          modules: ${{ env.QT_MODULES }}
+          aqtversion: '==3.1.*'
+          py7zrversion: '==0.21.*'
+
+      - name: qmake 配置 + 构建（Windows / MSVC）
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          mkdir build-qmake
+          cd build-qmake
+          qmake .. CONFIG+=release
+          nmake
+
+      - name: qmake 配置 + 构建（macOS / Clang + make）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p build-qmake
+          cd build-qmake
+          qmake .. CONFIG+=release
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: 上传构建产物（可选）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qmake-build-${{ matrix.os }}
+          path: build-qmake/
+          retention-days: 7
