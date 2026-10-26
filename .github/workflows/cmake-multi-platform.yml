@@ -34,12 +34,18 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         if: matrix.platform == 'windows'
 
-      - name: 安装 Ninja
-        run: |
-          if ("${{ matrix.platform }}" -eq "windows") { choco install ninja -y }
-          if ("${{ matrix.platform }}" -eq "macos")   { brew install ninja }
-          if ("${{ matrix.platform }}" -eq "linux")   { sudo apt-get update; sudo apt-get install -y ninja-build }
+      - name: 安装 Ninja (Windows)
+        if: matrix.platform == 'windows'
+        run: choco install ninja -y
 
+      - name: 安装 Ninja (macOS)
+        if: matrix.platform == 'macos'
+        run: brew install ninja
+
+      - name: 安装 Ninja (Linux)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        
       - name: 安装 Qt
         uses: jurplel/install-qt-action@v4
         with:
