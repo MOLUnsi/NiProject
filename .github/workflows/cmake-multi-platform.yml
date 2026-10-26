@@ -1,0 +1,75 @@
+name: Build Qt
+
+on: [push, pull_request]
+
+env:
+  QT_VERSION: '6.8.3'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            host: windows
+            arch: win64_msvc2022_64
+          - platform: macos
+            os: macos-latest
+            host: mac
+            arch: clang_64
+          - platform: linux
+            os: ubuntu-22.04
+            host: linux
+            arch: linux_gcc_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.platform == 'windows'
+
+      - name: 安装 Ninja
+        run: |
+          if ("${{ matrix.platform }}" -eq "windows") { choco install ninja -y }
+          if ("${{ matrix.platform }}" -eq "macos")   { brew install ninja }
+          if ("${{ matrix.platform }}" -eq "linux")   { sudo apt-get update; sudo apt-get install -y ninja-build }
+
+      - name: 安装 Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: ${{ matrix.host }}
+          arch: ${{ matrix.arch }}
+          target: desktop
+          cache: true
+
+      - name: 配置
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译
+        run: cmake --build build --config Release
+
+      - name: 打包 macOS
+        if: matrix.platform == 'macos'
+        run: |
+          macdeployqt build/MyApp.app
+          hdiutil create -volname MyApp -srcfolder build/MyApp.app -ov -format UDZO MyApp.dmg
+
+      - name: 打包 Windows
+        if: matrix.platform == 'windows'
+        run: |
+          windeployqt build/Release/MyApp.exe
+          Compress-Archive build/Release/* MyApp-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            *.dmg
+            *.zip
